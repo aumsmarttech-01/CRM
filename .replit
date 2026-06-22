@@ -1,0 +1,8 @@
+modules = ["nodejs-20"]
+run = "npm install && npm run db:generate && npm run db:deploy && npm run db:seed && npm run dev"
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+CLIENT_ORIGIN = "https://$REPL_SLUG.$REPL_OWNER.repl.co"
