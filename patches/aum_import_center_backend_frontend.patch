@@ -1,0 +1,888 @@
+diff -ruN /mnt/data/aum_current/artifacts/api-server/src/routes/data-imports.ts /mnt/data/aum_import_work/artifacts/api-server/src/routes/data-imports.ts
+--- /mnt/data/aum_current/artifacts/api-server/src/routes/data-imports.ts	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/aum_import_work/artifacts/api-server/src/routes/data-imports.ts	2026-06-24 17:02:56.316796264 +0000
+@@ -0,0 +1,386 @@
++import { Router } from "express";
++import { and, desc, eq } from "drizzle-orm";
++import { db } from "@workspace/db";
++import {
++  clientsTable,
++  followUpsTable,
++  importBatchesTable,
++  importRowsTable,
++  inventoryItemsTable,
++  invoiceItemsTable,
++  invoicesTable,
++  paymentsTable,
++  quotationItemsTable,
++  quotationsTable,
++  serviceCategoriesTable,
++} from "@workspace/db/schema";
++import { authenticate } from "../middleware/auth.js";
++
++const router = Router();
++
++type ImportSourceType =
++  | "CLIENTS_CSV"
++  | "QUOTATIONS_CSV"
++  | "INVOICES_CSV"
++  | "INVOICE_ITEMS_CSV"
++  | "INVENTORY_CSV"
++  | "SERVICE_CATEGORIES_CSV"
++  | "TASK_BOARD_CSV"
++  | "TASK_BOARD_PDF";
++
++type CsvRow = Record<string, string>;
++
++function parseCsv(content: string): CsvRow[] {
++  const rows: string[][] = [];
++  let field = "";
++  let row: string[] = [];
++  let quoted = false;
++
++  for (let i = 0; i < content.length; i += 1) {
++    const char = content[i];
++    const next = content[i + 1];
++    if (quoted) {
++      if (char === '"' && next === '"') {
++        field += '"';
++        i += 1;
++      } else if (char === '"') {
++        quoted = false;
++      } else {
++        field += char;
++      }
++      continue;
++    }
++    if (char === '"') {
++      quoted = true;
++    } else if (char === ",") {
++      row.push(field.trim());
++      field = "";
++    } else if (char === "\n") {
++      row.push(field.trim());
++      rows.push(row);
++      row = [];
++      field = "";
++    } else if (char !== "\r") {
++      field += char;
++    }
++  }
++  if (field || row.length) {
++    row.push(field.trim());
++    rows.push(row);
++  }
++
++  const [headers = [], ...body] = rows.filter((r) => r.some((cell) => cell.trim() !== ""));
++  const normalizedHeaders = headers.map((header, index) => normalizeHeader(header || `column_${index + 1}`));
++  return body.map((values) => {
++    const out: CsvRow = {};
++    normalizedHeaders.forEach((header, index) => {
++      out[header] = values[index]?.trim() ?? "";
++    });
++    return out;
++  });
++}
++
++function normalizeHeader(header: string): string {
++  return header
++    .trim()
++    .toLowerCase()
++    .replace(/[^a-z0-9]+/g, "_")
++    .replace(/^_+|_+$/g, "");
++}
++
++function pick(row: CsvRow, keys: string[]): string | undefined {
++  for (const key of keys) {
++    const value = row[normalizeHeader(key)] ?? row[key];
++    if (value && value.trim() !== "") return value.trim();
++  }
++  return undefined;
++}
++
++function money(value: string | undefined): string {
++  if (!value) return "0";
++  const cleaned = value.replace(/[^0-9.-]/g, "");
++  if (!cleaned || Number.isNaN(Number(cleaned))) return "0";
++  return Number(cleaned).toFixed(2);
++}
++
++function intValue(value: string | undefined, fallback = 0): number {
++  if (!value) return fallback;
++  const cleaned = value.replace(/[^0-9-]/g, "");
++  const parsed = Number.parseInt(cleaned, 10);
++  return Number.isFinite(parsed) ? parsed : fallback;
++}
++
++async function findOrCreateClient(clientName: string, actorUserId?: string) {
++  const name = clientName.trim() || "Unknown Legacy Client";
++  const [existing] = await db.select().from(clientsTable).where(eq(clientsTable.clientName, name)).limit(1);
++  if (existing) return existing;
++  const [created] = await db.insert(clientsTable).values({
++    clientName: name,
++    clientType: "LEGACY_IMPORT",
++    notes: actorUserId ? `Created by legacy import by ${actorUserId}` : "Created by legacy import",
++  }).returning();
++  return created;
++}
++
++function statusForQuotation(value?: string): "DRAFT" | "PENDING_APPROVAL" | "APPROVED" | "SENT" | "ACCEPTED" | "REJECTED" | "EXPIRED" {
++  const normalized = (value ?? "").toUpperCase();
++  if (normalized.includes("ACCEPT")) return "ACCEPTED";
++  if (normalized.includes("APPROV")) return "APPROVED";
++  if (normalized.includes("REJECT")) return "REJECTED";
++  if (normalized.includes("SENT")) return "SENT";
++  if (normalized.includes("EXPIRE")) return "EXPIRED";
++  return "DRAFT";
++}
++
++function statusForInvoice(value?: string, total = 0, paid = 0): "DRAFT" | "SENT" | "PARTIALLY_PAID" | "PAID" | "OVERDUE" | "CANCELLED" {
++  const normalized = (value ?? "").toUpperCase();
++  if (normalized.includes("CANCEL")) return "CANCELLED";
++  if (normalized.includes("OVERDUE")) return "OVERDUE";
++  if (paid >= total && total > 0) return "PAID";
++  if (paid > 0) return "PARTIALLY_PAID";
++  if (normalized.includes("DRAFT")) return "DRAFT";
++  return "SENT";
++}
++
++function classifyTarget(sourceType: ImportSourceType): string {
++  const map: Record<ImportSourceType, string> = {
++    CLIENTS_CSV: "clients",
++    QUOTATIONS_CSV: "quotations",
++    INVOICES_CSV: "invoices",
++    INVOICE_ITEMS_CSV: "invoice_items",
++    INVENTORY_CSV: "inventory_items",
++    SERVICE_CATEGORIES_CSV: "service_categories",
++    TASK_BOARD_CSV: "follow_ups",
++    TASK_BOARD_PDF: "follow_ups",
++  };
++  return map[sourceType];
++}
++
++async function processRow(sourceType: ImportSourceType, row: CsvRow, rowNumber: number, actorUserId?: string) {
++  if (sourceType === "TASK_BOARD_PDF") {
++    return {
++      targetTable: "follow_ups",
++      status: "REVIEW_REQUIRED" as const,
++      mappedData: { note: "PDF task-board rows need OCR/manual extraction before automated import.", row },
++      targetRecordId: null,
++    };
++  }
++
++  if (sourceType === "CLIENTS_CSV") {
++    const clientName = pick(row, ["client_name", "client", "customer", "name", "company"]);
++    if (!clientName) throw new Error("Missing client name");
++    const [client] = await db.insert(clientsTable).values({
++      clientName,
++      clientType: pick(row, ["client_type", "type"]) ?? "LEGACY",
++      contactPerson: pick(row, ["contact_person", "contact", "person"]),
++      phone: pick(row, ["phone", "mobile", "telephone"]),
++      email: pick(row, ["email", "mail"]),
++      location: pick(row, ["location", "area", "site"]),
++      address: pick(row, ["address"]),
++      kraPin: pick(row, ["kra_pin", "kra"]),
++      notes: pick(row, ["notes", "remark", "remarks"]),
++    }).returning();
++    return { targetTable: "clients", status: "IMPORTED" as const, mappedData: client, targetRecordId: client.id };
++  }
++
++  if (sourceType === "SERVICE_CATEGORIES_CSV") {
++    const name = pick(row, ["name", "category", "service_category", "service"]);
++    if (!name) throw new Error("Missing service category name");
++    const [existing] = await db.select().from(serviceCategoriesTable).where(eq(serviceCategoriesTable.name, name)).limit(1);
++    if (existing) return { targetTable: "service_categories", status: "SKIPPED" as const, mappedData: existing, targetRecordId: existing.id };
++    const [category] = await db.insert(serviceCategoriesTable).values({ name, description: pick(row, ["description", "notes"]) }).returning();
++    return { targetTable: "service_categories", status: "IMPORTED" as const, mappedData: category, targetRecordId: category.id };
++  }
++
++  if (sourceType === "INVENTORY_CSV") {
++    const itemName = pick(row, ["item_name", "item", "description", "name"]);
++    if (!itemName) throw new Error("Missing inventory item name");
++    const sku = pick(row, ["sku", "item_code", "code"]) ?? `LEGACY-${rowNumber}`;
++    const [existing] = await db.select().from(inventoryItemsTable).where(eq(inventoryItemsTable.sku, sku)).limit(1);
++    if (existing) return { targetTable: "inventory_items", status: "SKIPPED" as const, mappedData: existing, targetRecordId: existing.id };
++    const [item] = await db.insert(inventoryItemsTable).values({
++      itemName,
++      category: pick(row, ["category", "type"]) ?? "Legacy Import",
++      sku,
++      quantityAvailable: intValue(pick(row, ["quantity_available", "qty", "quantity", "stock"]), 0),
++      unitCost: money(pick(row, ["unit_cost", "cost", "buying_price"])),
++      sellingPrice: money(pick(row, ["selling_price", "price", "unit_rate", "rate"])),
++      supplier: pick(row, ["supplier", "vendor"]),
++      reorderLevel: intValue(pick(row, ["reorder_level", "minimum_stock"]), 0),
++    }).returning();
++    return { targetTable: "inventory_items", status: "IMPORTED" as const, mappedData: item, targetRecordId: item.id };
++  }
++
++  if (sourceType === "QUOTATIONS_CSV") {
++    const client = await findOrCreateClient(pick(row, ["client", "client_name", "customer", "name"]) ?? "Unknown Legacy Client", actorUserId);
++    const quoteNumber = pick(row, ["quote_number", "quotation_number", "quotation_no", "quote_no", "number"]) ?? `LEG-Q-${rowNumber}`;
++    const [existing] = await db.select().from(quotationsTable).where(eq(quotationsTable.quoteNumber, quoteNumber)).limit(1);
++    if (existing) return { targetTable: "quotations", status: "SKIPPED" as const, mappedData: existing, targetRecordId: existing.id };
++    const total = money(pick(row, ["grand_total", "total", "amount", "quote_total"]));
++    const subtotal = money(pick(row, ["subtotal", "amount_before_vat"]) ?? total);
++    const [quotation] = await db.insert(quotationsTable).values({
++      quoteNumber,
++      clientId: client.id,
++      projectName: pick(row, ["project_name", "project", "site", "description"]) ?? quoteNumber,
++      scopeOfSupply: pick(row, ["scope_of_supply", "scope", "description", "notes"]) ?? "Legacy imported quotation",
++      subtotal,
++      vatAmount: money(pick(row, ["vat", "vat_amount", "tax"])),
++      grandTotal: total,
++      status: statusForQuotation(pick(row, ["status"])),
++      preparedBy: pick(row, ["prepared_by", "created_by"]),
++    }).returning();
++    const itemDescription = pick(row, ["item", "description", "scope", "project_name"]);
++    if (itemDescription) {
++      await db.insert(quotationItemsTable).values({
++        quotationId: quotation.id,
++        description: itemDescription,
++        quantity: intValue(pick(row, ["quantity", "qty"]), 1),
++        unitRate: subtotal,
++        vatAmount: money(pick(row, ["vat", "vat_amount", "tax"])),
++        totalAmount: total,
++      });
++    }
++    return { targetTable: "quotations", status: "IMPORTED" as const, mappedData: quotation, targetRecordId: quotation.id };
++  }
++
++  if (sourceType === "INVOICES_CSV") {
++    const client = await findOrCreateClient(pick(row, ["client", "client_name", "customer", "name"]) ?? "Unknown Legacy Client", actorUserId);
++    const invoiceNumber = pick(row, ["invoice_number", "invoice_no", "inv_no", "number"]) ?? `LEG-INV-${rowNumber}`;
++    const [existing] = await db.select().from(invoicesTable).where(eq(invoicesTable.invoiceNumber, invoiceNumber)).limit(1);
++    if (existing) return { targetTable: "invoices", status: "SKIPPED" as const, mappedData: existing, targetRecordId: existing.id };
++    const total = Number(money(pick(row, ["grand_total", "total", "amount", "invoice_total"])));
++    const paid = Number(money(pick(row, ["amount_paid", "paid", "received"]))) || 0;
++    const [invoice] = await db.insert(invoicesTable).values({
++      invoiceNumber,
++      clientId: client.id,
++      subtotal: money(pick(row, ["subtotal", "amount_before_vat"]) ?? String(total)),
++      vatAmount: money(pick(row, ["vat", "vat_amount", "tax"])),
++      grandTotal: total.toFixed(2),
++      amountPaid: paid.toFixed(2),
++      balanceDue: Math.max(total - paid, 0).toFixed(2),
++      status: statusForInvoice(pick(row, ["status"]), total, paid),
++      notes: pick(row, ["notes", "remarks", "description"]),
++    }).returning();
++    if (paid > 0) {
++      await db.insert(paymentsTable).values({
++        invoiceId: invoice.id,
++        amount: paid.toFixed(2),
++        paymentMethod: pick(row, ["payment_method", "method"]) ?? "LEGACY",
++        paymentReference: pick(row, ["payment_reference", "reference", "receipt"]),
++        notes: "Imported from legacy invoice data",
++      });
++    }
++    return { targetTable: "invoices", status: "IMPORTED" as const, mappedData: invoice, targetRecordId: invoice.id };
++  }
++
++  if (sourceType === "INVOICE_ITEMS_CSV") {
++    const invoiceNumber = pick(row, ["invoice_number", "invoice_no", "inv_no"]);
++    if (!invoiceNumber) throw new Error("Missing invoice number for invoice item");
++    const [invoice] = await db.select().from(invoicesTable).where(eq(invoicesTable.invoiceNumber, invoiceNumber)).limit(1);
++    if (!invoice) throw new Error(`Invoice not found: ${invoiceNumber}`);
++    const total = money(pick(row, ["total_amount", "total", "amount"]));
++    const [item] = await db.insert(invoiceItemsTable).values({
++      invoiceId: invoice.id,
++      itemCode: pick(row, ["item_code", "code", "sku"]),
++      description: pick(row, ["description", "item", "name"]) ?? "Legacy imported invoice item",
++      quantity: intValue(pick(row, ["quantity", "qty"]), 1),
++      unitRate: money(pick(row, ["unit_rate", "rate", "price"]) ?? total),
++      vatAmount: money(pick(row, ["vat", "vat_amount", "tax"])),
++      totalAmount: total,
++    }).returning();
++    return { targetTable: "invoice_items", status: "IMPORTED" as const, mappedData: item, targetRecordId: item.id };
++  }
++
++  if (sourceType === "TASK_BOARD_CSV") {
++    const subject = pick(row, ["subject", "task", "item", "client", "name", "pending_sites", "quotation_to_make", "lead_follow_up", "invoice_to_make", "vasuli", "work_done", "to_meet_visit", "amc", "approved"]);
++    if (!subject) return { targetTable: "follow_ups", status: "SKIPPED" as const, mappedData: row, targetRecordId: null };
++    const bucket = pick(row, ["bucket", "category", "column", "section"]) ?? "Legacy Task Board";
++    const [followUp] = await db.insert(followUpsTable).values({
++      assignedTo: actorUserId ?? "SYSTEM",
++      dueDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
++      subject: `${bucket}: ${subject}`,
++      notes: JSON.stringify(row),
++      priority: bucket.toLowerCase().includes("priority") ? "HIGH" : "MEDIUM",
++      status: bucket.toLowerCase().includes("work_done") ? "DONE" : "PENDING",
++      createdBy: actorUserId,
++    }).returning();
++    return { targetTable: "follow_ups", status: "IMPORTED" as const, mappedData: followUp, targetRecordId: followUp.id };
++  }
++
++  throw new Error(`Unsupported import source type: ${sourceType}`);
++}
++
++router.get("/history", authenticate, async (_req, res) => {
++  const batches = await db.select().from(importBatchesTable).orderBy(desc(importBatchesTable.createdAt)).limit(100);
++  res.json(batches);
++});
++
++router.get("/:id/rows", authenticate, async (req, res) => {
++  const rows = await db.select().from(importRowsTable).where(eq(importRowsTable.batchId, String(req.params.id))).orderBy(importRowsTable.rowNumber).limit(500);
++  res.json(rows);
++});
++
++router.post("/preview", authenticate, async (req, res) => {
++  const { sourceType, content } = req.body as { sourceType?: ImportSourceType; content?: string };
++  if (!sourceType || !content) { res.status(400).json({ error: "sourceType and content are required" }); return; }
++  const rows = sourceType === "TASK_BOARD_PDF" ? [] : parseCsv(content);
++  res.json({ sourceType, totalRows: rows.length, previewRows: rows.slice(0, 10), targetModule: classifyTarget(sourceType) });
++});
++
++router.post("/process", authenticate, async (req, res) => {
++  const { fileName, sourceType, content, notes } = req.body as { fileName?: string; sourceType?: ImportSourceType; content?: string; notes?: string };
++  if (!fileName || !sourceType || !content) { res.status(400).json({ error: "fileName, sourceType and content are required" }); return; }
++
++  const user = (req as any).user as { userId?: string; email?: string } | undefined;
++  const rows = sourceType === "TASK_BOARD_PDF" ? [{ fileName, note: "PDF uploaded for manual extraction" }] as CsvRow[] : parseCsv(content);
++  const [batch] = await db.insert(importBatchesTable).values({
++    sourceFileName: fileName,
++    sourceType,
++    targetModule: classifyTarget(sourceType),
++    totalRows: rows.length,
++    status: sourceType === "TASK_BOARD_PDF" ? "REVIEW_REQUIRED" : "PROCESSING",
++    uploadedBy: user?.userId,
++    notes,
++  }).returning();
++
++  let importedRows = 0;
++  let skippedRows = 0;
++  let errorRows = 0;
++  let reviewRows = 0;
++
++  for (let i = 0; i < rows.length; i += 1) {
++    const row = rows[i];
++    try {
++      const result = await processRow(sourceType, row, i + 2, user?.userId);
++      if (result.status === "IMPORTED") importedRows += 1;
++      if (result.status === "SKIPPED") skippedRows += 1;
++      if (result.status === "REVIEW_REQUIRED") reviewRows += 1;
++      await db.insert(importRowsTable).values({
++        batchId: batch.id,
++        rowNumber: i + 2,
++        rawData: row,
++        mappedData: result.mappedData,
++        status: result.status,
++        targetTable: result.targetTable,
++        targetRecordId: result.targetRecordId,
++      });
++    } catch (error) {
++      errorRows += 1;
++      await db.insert(importRowsTable).values({
++        batchId: batch.id,
++        rowNumber: i + 2,
++        rawData: row,
++        status: "ERROR",
++        targetTable: classifyTarget(sourceType),
++        errorMessage: error instanceof Error ? error.message : String(error),
++      });
++    }
++  }
++
++  const finalStatus = errorRows > 0 && importedRows > 0 ? "PARTIAL" : errorRows > 0 ? "FAILED" : reviewRows > 0 ? "REVIEW_REQUIRED" : "IMPORTED";
++  const [updated] = await db.update(importBatchesTable).set({
++    importedRows,
++    skippedRows,
++    errorRows,
++    status: finalStatus,
++  }).where(eq(importBatchesTable.id, batch.id)).returning();
++
++  res.status(201).json(updated);
++});
++
++router.delete("/:id", authenticate, async (req, res) => {
++  const batchId = String(req.params.id);
++  await db.delete(importRowsTable).where(eq(importRowsTable.batchId, batchId));
++  await db.delete(importBatchesTable).where(eq(importBatchesTable.id, batchId));
++  res.status(204).end();
++});
++
++export default router;
+diff -ruN /mnt/data/aum_current/artifacts/api-server/src/routes/index.ts /mnt/data/aum_import_work/artifacts/api-server/src/routes/index.ts
+--- /mnt/data/aum_current/artifacts/api-server/src/routes/index.ts	2026-06-10 22:20:04.000000000 +0000
++++ /mnt/data/aum_import_work/artifacts/api-server/src/routes/index.ts	2026-06-24 17:03:18.788528369 +0000
+@@ -43,6 +43,7 @@
+ import employeeAdvancesRouter from "./employee-advances.js";
+ import leaveRequestsRouter from "./leave-requests.js";
+ import crmDocumentsRouter from "./crm-documents.js";
++import dataImportsRouter from "./data-imports.js";
+ import { authenticate, requireCapability } from "../middleware/auth.js";
+ 
+ const router: IRouter = Router();
+@@ -111,6 +112,7 @@
+ router.use("/employee-advances", authenticate, requireCapability("employee-advances"), employeeAdvancesRouter);
+ router.use("/leave-requests", authenticate, requireCapability("leave-requests"), leaveRequestsRouter);
+ router.use("/crm-documents", authenticate, requireCapability("crm-documents"), crmDocumentsRouter);
++router.use("/data-imports", authenticate, requireCapability("settings"), dataImportsRouter);
+ 
+ router.use(storageRouter);
+ 
+diff -ruN /mnt/data/aum_current/artifacts/crm/src/App.tsx /mnt/data/aum_import_work/artifacts/crm/src/App.tsx
+--- /mnt/data/aum_current/artifacts/crm/src/App.tsx	2026-06-10 22:19:56.000000000 +0000
++++ /mnt/data/aum_import_work/artifacts/crm/src/App.tsx	2026-06-24 17:03:18.760528704 +0000
+@@ -54,6 +54,7 @@
+ import EmployeeAdvances from "@/pages/employee-advances/index";
+ import LeaveRequests from "@/pages/leave-requests/index";
+ import CrmDocuments from "@/pages/crm-documents/index";
++import AdminImports from "@/pages/admin/imports/index";
+ 
+ import ClientPortalLogin from "@/pages/client-portal/index";
+ import ClientPortalDashboard from "@/pages/client-portal/dashboard";
+@@ -156,6 +157,10 @@
+         {() => <ProtectedRoute component={Settings} capability="settings" />}
+       </Route>
+ 
++      <Route path="/admin/imports">
++        {() => <ProtectedRoute component={AdminImports} capability="settings" />}
++      </Route>
++
+       <Route path="/site-visits">
+         {() => <ProtectedRoute component={SiteVisits} capability="site-visits" />}
+       </Route>
+diff -ruN /mnt/data/aum_current/artifacts/crm/src/components/layout/app-layout.tsx /mnt/data/aum_import_work/artifacts/crm/src/components/layout/app-layout.tsx
+--- /mnt/data/aum_current/artifacts/crm/src/components/layout/app-layout.tsx	2026-06-10 22:19:54.000000000 +0000
++++ /mnt/data/aum_import_work/artifacts/crm/src/components/layout/app-layout.tsx	2026-06-24 17:03:18.780528465 +0000
+@@ -13,7 +13,7 @@
+   DollarSign, Bot, ChevronDown, ChevronRight, AlertTriangle, Scale, Zap,
+   UserCog, CalendarDays, Wallet, Building2, ListChecks, Clock, Timer,
+   Receipt, Banknote, CreditCard, Umbrella, PieChart, ShoppingCart,
+-  FileTextIcon, type LucideIcon,
++  FileTextIcon, UploadCloud, type LucideIcon,
+ } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+ import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
+@@ -167,6 +167,7 @@
+         { href: "/users", label: "Users", icon: Users, cap: "users" },
+         { href: "/automations", label: "Automations", icon: Zap, cap: "automations" },
+         { href: "/settings", label: "Settings", icon: Settings, cap: "settings" },
++        { href: "/admin/imports", label: "Data Imports", icon: UploadCloud, cap: "settings" },
+       ],
+     },
+   ];
+diff -ruN /mnt/data/aum_current/artifacts/crm/src/pages/admin/imports/index.tsx /mnt/data/aum_import_work/artifacts/crm/src/pages/admin/imports/index.tsx
+--- /mnt/data/aum_current/artifacts/crm/src/pages/admin/imports/index.tsx	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/aum_import_work/artifacts/crm/src/pages/admin/imports/index.tsx	2026-06-24 17:03:14.212582702 +0000
+@@ -0,0 +1,264 @@
++import { useMemo, useState } from "react";
++import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
++import { Upload, Database, AlertTriangle, CheckCircle2, FileText, RefreshCcw } from "lucide-react";
++import { Badge } from "@/components/ui/badge";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { Input } from "@/components/ui/input";
++import { Textarea } from "@/components/ui/textarea";
++import { useAuth } from "@/lib/auth";
++
++type SourceType =
++  | "CLIENTS_CSV"
++  | "QUOTATIONS_CSV"
++  | "INVOICES_CSV"
++  | "INVOICE_ITEMS_CSV"
++  | "INVENTORY_CSV"
++  | "SERVICE_CATEGORIES_CSV"
++  | "TASK_BOARD_CSV"
++  | "TASK_BOARD_PDF";
++
++type ImportBatch = {
++  id: string;
++  sourceFileName: string;
++  sourceType: string;
++  targetModule: string;
++  status: string;
++  totalRows: number;
++  importedRows: number;
++  skippedRows: number;
++  errorRows: number;
++  notes?: string | null;
++  createdAt: string;
++};
++
++type PreviewResult = {
++  sourceType: SourceType;
++  totalRows: number;
++  previewRows: Record<string, string>[];
++  targetModule: string;
++};
++
++function apiUrl(path: string) {
++  return `${import.meta.env.BASE_URL.replace(/\/$/, "")}/api${path}`;
++}
++
++const importTypes: { value: SourceType; label: string; description: string }[] = [
++  { value: "CLIENTS_CSV", label: "Clients CSV", description: "Import client master records." },
++  { value: "QUOTATIONS_CSV", label: "Quotation.csv", description: "Import quotations and quotation summary items." },
++  { value: "INVOICES_CSV", label: "Invoices.csv", description: "Import invoice headers and payment totals." },
++  { value: "INVOICE_ITEMS_CSV", label: "Invoice Items CSV", description: "Import invoice line items after invoice headers." },
++  { value: "INVENTORY_CSV", label: "Items.csv", description: "Import inventory items and stock balances." },
++  { value: "SERVICE_CATEGORIES_CSV", label: "Service Categories CSV", description: "Seed CRM service categories." },
++  { value: "TASK_BOARD_CSV", label: "Task Board CSV", description: "Import task-board items into follow-ups." },
++  { value: "TASK_BOARD_PDF", label: "AumSmart Quotes PDF", description: "Store PDF task-board upload for review/manual extraction." },
++];
++
++function statusBadge(status: string) {
++  if (status === "IMPORTED") return <Badge className="bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300">Imported</Badge>;
++  if (status === "PARTIAL") return <Badge className="bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300">Partial</Badge>;
++  if (status === "FAILED") return <Badge className="bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300">Failed</Badge>;
++  if (status === "REVIEW_REQUIRED") return <Badge variant="outline">Review Required</Badge>;
++  return <Badge variant="secondary">{status}</Badge>;
++}
++
++export default function AdminImports() {
++  const { token } = useAuth();
++  const queryClient = useQueryClient();
++  const [sourceType, setSourceType] = useState<SourceType>("QUOTATIONS_CSV");
++  const [fileName, setFileName] = useState("");
++  const [content, setContent] = useState("");
++  const [notes, setNotes] = useState("");
++  const [preview, setPreview] = useState<PreviewResult | null>(null);
++  const [message, setMessage] = useState<string | null>(null);
++
++  const headers = useMemo(() => ({ Authorization: `Bearer ${token}`, "Content-Type": "application/json" }), [token]);
++
++  const history = useQuery<ImportBatch[]>({
++    queryKey: ["data-imports", "history"],
++    queryFn: async () => {
++      const res = await fetch(apiUrl("/data-imports/history"), { headers });
++      if (!res.ok) throw new Error("Failed to load import history");
++      return res.json();
++    },
++    enabled: Boolean(token),
++  });
++
++  const previewMutation = useMutation({
++    mutationFn: async () => {
++      const res = await fetch(apiUrl("/data-imports/preview"), {
++        method: "POST",
++        headers,
++        body: JSON.stringify({ sourceType, content }),
++      });
++      if (!res.ok) throw new Error((await res.json()).error ?? "Preview failed");
++      return res.json() as Promise<PreviewResult>;
++    },
++    onSuccess: (data) => {
++      setPreview(data);
++      setMessage(`Preview ready: ${data.totalRows} rows targeting ${data.targetModule}.`);
++    },
++    onError: (error) => setMessage(error instanceof Error ? error.message : String(error)),
++  });
++
++  const processMutation = useMutation({
++    mutationFn: async () => {
++      const res = await fetch(apiUrl("/data-imports/process"), {
++        method: "POST",
++        headers,
++        body: JSON.stringify({ fileName: fileName || "uploaded-file", sourceType, content, notes }),
++      });
++      if (!res.ok) throw new Error((await res.json()).error ?? "Import failed");
++      return res.json() as Promise<ImportBatch>;
++    },
++    onSuccess: (batch) => {
++      setMessage(`Import ${batch.status}: ${batch.importedRows} imported, ${batch.skippedRows} skipped, ${batch.errorRows} errors.`);
++      setPreview(null);
++      queryClient.invalidateQueries({ queryKey: ["data-imports", "history"] });
++    },
++    onError: (error) => setMessage(error instanceof Error ? error.message : String(error)),
++  });
++
++  async function handleFile(file?: File) {
++    if (!file) return;
++    setFileName(file.name);
++    if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
++      setSourceType("TASK_BOARD_PDF");
++      setContent(`PDF file selected: ${file.name}. Use the parsed legacy task-board CSV for automatic row import, or keep this batch as review-required evidence.`);
++      setMessage("PDF selected. This will be stored as review-required; use CSV for automatic import.");
++      return;
++    }
++    const text = await file.text();
++    setContent(text);
++    setMessage(`Loaded ${file.name}. Select the correct import type, then preview.`);
++  }
++
++  return (
++    <div className="space-y-6">
++      <div className="flex items-center justify-between">
++        <div>
++          <h2 className="text-3xl font-bold tracking-tight text-foreground">Data Imports</h2>
++          <p className="text-muted-foreground">Render legacy quotations, invoices, items, clients, and task-board data into the CRM/ERP.</p>
++        </div>
++        <Button variant="outline" onClick={() => history.refetch()} disabled={history.isFetching}>
++          <RefreshCcw className="mr-2 h-4 w-4" /> Refresh
++        </Button>
++      </div>
++
++      <div className="grid gap-4 md:grid-cols-4">
++        <Card>
++          <CardContent className="p-4 flex items-center gap-3"><Database className="h-5 w-5" /><div><p className="text-xs text-muted-foreground">Batches</p><p className="text-2xl font-bold">{history.data?.length ?? 0}</p></div></CardContent>
++        </Card>
++        <Card>
++          <CardContent className="p-4 flex items-center gap-3"><CheckCircle2 className="h-5 w-5" /><div><p className="text-xs text-muted-foreground">Imported Rows</p><p className="text-2xl font-bold">{history.data?.reduce((s, b) => s + b.importedRows, 0) ?? 0}</p></div></CardContent>
++        </Card>
++        <Card>
++          <CardContent className="p-4 flex items-center gap-3"><AlertTriangle className="h-5 w-5" /><div><p className="text-xs text-muted-foreground">Error Rows</p><p className="text-2xl font-bold">{history.data?.reduce((s, b) => s + b.errorRows, 0) ?? 0}</p></div></CardContent>
++        </Card>
++        <Card>
++          <CardContent className="p-4 flex items-center gap-3"><FileText className="h-5 w-5" /><div><p className="text-xs text-muted-foreground">Review Needed</p><p className="text-2xl font-bold">{history.data?.filter((b) => b.status === "REVIEW_REQUIRED").length ?? 0}</p></div></CardContent>
++        </Card>
++      </div>
++
++      <Card>
++        <CardHeader><CardTitle>Upload and Process Legacy File</CardTitle></CardHeader>
++        <CardContent className="space-y-4">
++          <div className="grid gap-4 md:grid-cols-3">
++            <div className="space-y-2">
++              <label className="text-sm font-medium">File</label>
++              <Input type="file" accept=".csv,.txt,.pdf" onChange={(event) => handleFile(event.target.files?.[0])} />
++              <p className="text-xs text-muted-foreground">Use CSV for automatic import. PDF is held for review.</p>
++            </div>
++            <div className="space-y-2">
++              <label className="text-sm font-medium">Import Type</label>
++              <select className="w-full rounded-md border bg-background px-3 py-2 text-sm" value={sourceType} onChange={(event) => setSourceType(event.target.value as SourceType)}>
++                {importTypes.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}
++              </select>
++              <p className="text-xs text-muted-foreground">{importTypes.find((type) => type.value === sourceType)?.description}</p>
++            </div>
++            <div className="space-y-2">
++              <label className="text-sm font-medium">Notes</label>
++              <Input value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Optional import note" />
++            </div>
++          </div>
++
++          <Textarea className="min-h-40 font-mono text-xs" value={content} onChange={(event) => setContent(event.target.value)} placeholder="CSV content appears here. You can paste CSV manually if needed." />
++
++          <div className="flex gap-2">
++            <Button variant="outline" onClick={() => previewMutation.mutate()} disabled={!content || previewMutation.isPending || sourceType === "TASK_BOARD_PDF"}>Preview</Button>
++            <Button onClick={() => processMutation.mutate()} disabled={!content || processMutation.isPending}>
++              <Upload className="mr-2 h-4 w-4" /> Process Import
++            </Button>
++          </div>
++
++          {message && <div className="rounded-md border bg-muted/50 px-3 py-2 text-sm">{message}</div>}
++        </CardContent>
++      </Card>
++
++      {preview && (
++        <Card>
++          <CardHeader><CardTitle>Preview: {preview.totalRows} Rows → {preview.targetModule}</CardTitle></CardHeader>
++          <CardContent>
++            <div className="overflow-auto rounded-md border">
++              <table className="w-full text-xs">
++                <thead className="bg-muted/50">
++                  <tr>{Object.keys(preview.previewRows[0] ?? {}).map((key) => <th key={key} className="px-3 py-2 text-left font-medium">{key}</th>)}</tr>
++                </thead>
++                <tbody>
++                  {preview.previewRows.map((row, index) => (
++                    <tr key={index} className="border-t">
++                      {Object.keys(preview.previewRows[0] ?? {}).map((key) => <td key={key} className="px-3 py-2 align-top">{row[key]}</td>)}
++                    </tr>
++                  ))}
++                </tbody>
++              </table>
++            </div>
++          </CardContent>
++        </Card>
++      )}
++
++      <Card>
++        <CardHeader><CardTitle>Import History</CardTitle></CardHeader>
++        <CardContent>
++          <div className="overflow-auto rounded-md border">
++            <table className="w-full text-sm">
++              <thead className="bg-muted/50 text-xs uppercase text-muted-foreground">
++                <tr>
++                  <th className="px-4 py-3 text-left">File</th>
++                  <th className="px-4 py-3 text-left">Type</th>
++                  <th className="px-4 py-3 text-left">Status</th>
++                  <th className="px-4 py-3 text-right">Rows</th>
++                  <th className="px-4 py-3 text-right">Imported</th>
++                  <th className="px-4 py-3 text-right">Skipped</th>
++                  <th className="px-4 py-3 text-right">Errors</th>
++                  <th className="px-4 py-3 text-left">Created</th>
++                </tr>
++              </thead>
++              <tbody className="divide-y">
++                {history.data?.map((batch) => (
++                  <tr key={batch.id}>
++                    <td className="px-4 py-3 font-medium">{batch.sourceFileName}</td>
++                    <td className="px-4 py-3">{batch.sourceType}</td>
++                    <td className="px-4 py-3">{statusBadge(batch.status)}</td>
++                    <td className="px-4 py-3 text-right">{batch.totalRows}</td>
++                    <td className="px-4 py-3 text-right">{batch.importedRows}</td>
++                    <td className="px-4 py-3 text-right">{batch.skippedRows}</td>
++                    <td className="px-4 py-3 text-right">{batch.errorRows}</td>
++                    <td className="px-4 py-3">{new Date(batch.createdAt).toLocaleString()}</td>
++                  </tr>
++                ))}
++                {history.data?.length === 0 && <tr><td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">No imports yet.</td></tr>}
++              </tbody>
++            </table>
++          </div>
++        </CardContent>
++      </Card>
++    </div>
++  );
++}
+diff -ruN /mnt/data/aum_current/docs/import-center-backend-frontend.md /mnt/data/aum_import_work/docs/import-center-backend-frontend.md
+--- /mnt/data/aum_current/docs/import-center-backend-frontend.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/aum_import_work/docs/import-center-backend-frontend.md	2026-06-24 17:03:38.428293464 +0000
+@@ -0,0 +1,79 @@
++# AUM CRM Import Center Backend + Frontend
++
++## Purpose
++
++Render legacy business files into AUM CRM modules instead of leaving them as disconnected CSV/PDF files.
++
++## Backend
++
++Added schema:
++
++- `import_batches`
++- `import_rows`
++
++Added API route:
++
++- `GET /api/data-imports/history`
++- `GET /api/data-imports/:id/rows`
++- `POST /api/data-imports/preview`
++- `POST /api/data-imports/process`
++- `DELETE /api/data-imports/:id`
++
++Route mount:
++
++```ts
++router.use("/data-imports", authenticate, requireCapability("settings"), dataImportsRouter);
++```
++
++## Frontend
++
++Added page:
++
++- `/admin/imports`
++
++Added sidebar item:
++
++- Admin → Data Imports
++
++## Import mapping
++
++| Source | Target |
++| --- | --- |
++| Clients CSV | clients |
++| Quotation.csv | clients, quotations, quotation_items |
++| Invoices.csv | clients, invoices, payments |
++| Invoice Items CSV | invoice_items |
++| Items.csv | inventory_items |
++| Service Categories CSV | service_categories |
++| Task Board CSV | follow_ups |
++| AumSmart Quotes PDF | import batch marked REVIEW_REQUIRED |
++
++## Operational rule
++
++PDF files should be kept as review evidence or converted to CSV before automated import. CSV files are parsed and inserted into the normalized Supabase tables.
++
++## Apply steps
++
++1. Copy patch files into the same paths.
++2. Run Drizzle push to create `import_batches` and `import_rows`.
++3. Run typecheck/build.
++4. Open `/admin/imports`.
++5. Upload and preview each CSV.
++6. Process imports in this order:
++   - service categories
++   - clients
++   - inventory items
++   - quotations
++   - invoices
++   - invoice items
++   - task board CSV
++   - PDF as review-required evidence
++
++## Verification
++
++```sql
++select source_file_name, source_type, status, total_rows, imported_rows, skipped_rows, error_rows
++from import_batches
++order by created_at desc;
++```
++
+diff -ruN /mnt/data/aum_current/lib/db/src/schema/imports.ts /mnt/data/aum_import_work/lib/db/src/schema/imports.ts
+--- /mnt/data/aum_current/lib/db/src/schema/imports.ts	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/aum_import_work/lib/db/src/schema/imports.ts	2026-06-24 17:01:15.521985272 +0000
+@@ -0,0 +1,67 @@
++import { index, integer, jsonb, pgEnum, pgTable, text, timestamp } from "drizzle-orm/pg-core";
++import { createInsertSchema } from "drizzle-zod";
++import { z } from "zod/v4";
++
++export const importBatchStatusEnum = pgEnum("import_batch_status", [
++  "UPLOADED",
++  "VALIDATED",
++  "PROCESSING",
++  "IMPORTED",
++  "PARTIAL",
++  "FAILED",
++  "REVIEW_REQUIRED",
++]);
++
++export const importRowStatusEnum = pgEnum("import_row_status", [
++  "PENDING",
++  "IMPORTED",
++  "SKIPPED",
++  "ERROR",
++  "REVIEW_REQUIRED",
++]);
++
++export const importBatchesTable = pgTable("import_batches", {
++  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
++  sourceFileName: text("source_file_name").notNull(),
++  sourceType: text("source_type").notNull(),
++  targetModule: text("target_module").notNull(),
++  status: importBatchStatusEnum("status").notNull().default("UPLOADED"),
++  totalRows: integer("total_rows").notNull().default(0),
++  importedRows: integer("imported_rows").notNull().default(0),
++  skippedRows: integer("skipped_rows").notNull().default(0),
++  errorRows: integer("error_rows").notNull().default(0),
++  uploadedBy: text("uploaded_by"),
++  notes: text("notes"),
++  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
++  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
++}, (table) => ({
++  statusIdx: index("import_batches_status_idx").on(table.status),
++  sourceTypeIdx: index("import_batches_source_type_idx").on(table.sourceType),
++  createdAtIdx: index("import_batches_created_at_idx").on(table.createdAt),
++}));
++
++export const importRowsTable = pgTable("import_rows", {
++  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
++  batchId: text("batch_id").notNull(),
++  rowNumber: integer("row_number").notNull(),
++  targetTable: text("target_table"),
++  targetRecordId: text("target_record_id"),
++  status: importRowStatusEnum("status").notNull().default("PENDING"),
++  rawData: jsonb("raw_data").notNull(),
++  mappedData: jsonb("mapped_data"),
++  errorMessage: text("error_message"),
++  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
++  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
++}, (table) => ({
++  batchIdx: index("import_rows_batch_idx").on(table.batchId),
++  statusIdx: index("import_rows_status_idx").on(table.status),
++  targetIdx: index("import_rows_target_idx").on(table.targetTable, table.targetRecordId),
++}));
++
++export const insertImportBatchSchema = createInsertSchema(importBatchesTable).omit({ id: true, createdAt: true, updatedAt: true });
++export const insertImportRowSchema = createInsertSchema(importRowsTable).omit({ id: true, createdAt: true, updatedAt: true });
++
++export type ImportBatch = typeof importBatchesTable.$inferSelect;
++export type InsertImportBatch = z.infer<typeof insertImportBatchSchema>;
++export type ImportRow = typeof importRowsTable.$inferSelect;
++export type InsertImportRow = z.infer<typeof insertImportRowSchema>;
+diff -ruN /mnt/data/aum_current/lib/db/src/schema/index.ts /mnt/data/aum_import_work/lib/db/src/schema/index.ts
+--- /mnt/data/aum_current/lib/db/src/schema/index.ts	2026-06-10 22:20:02.000000000 +0000
++++ /mnt/data/aum_import_work/lib/db/src/schema/index.ts	2026-06-24 17:01:15.521985272 +0000
+@@ -24,3 +24,5 @@
+ export * from "./review_requests";
+ export * from "./client_users";
+ export * from "./operations";
++
++export * from "./imports";
