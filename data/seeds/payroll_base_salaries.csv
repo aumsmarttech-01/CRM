@@ -1,5 +1,6 @@
-employee_name,base_salary_kes,deductions_kes,notes
-Bromnick,20000,0,Initial payroll structure provided by owner
-Cliff,25000,0,Initial payroll structure provided by owner
-Hamishi,25000,0,Initial payroll structure provided by owner
-Kepha Mobe,25000,0,Initial payroll structure provided by owner
+employee_name,base_salary_kes,deductions_kes,pay_type,daily_rate_kes,phone,notes
+Bromnick,20000,0,monthly,, ,Initial payroll structure provided by owner
+Cliff,25000,0,monthly,, ,Initial payroll structure provided by owner
+Hamishi,25000,0,monthly,, ,Initial payroll structure provided by owner
+Kepha Mobe,25000,0,monthly,, ,Initial payroll structure provided by owner
+Michael,0,0,daily,700,+254733915018,Casual technician for extra work; paid per day worked
