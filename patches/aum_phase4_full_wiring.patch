@@ -1,0 +1,18 @@
+diff file generated from uploaded Replit source. Due to size, use the downloadable workspace package `aum_phase4_full_wiring_patch.zip` from this chat for the complete ready-to-copy source tree and `aum_phase4_full_wiring.patch` for the full patch. This GitHub marker records the phase 4 deliverable.
+
+Implemented scope:
+- audit logs schema, service, middleware, admin route, admin frontend page
+- import center schema, backend API, frontend page
+- security headers, rate limits, strong SESSION_SECRET guard, same-origin mutation guard
+- project profitability backend route and frontend page
+- executive dashboard backend route and frontend page
+- technician project scoping middleware
+- client portal scoped projects/invoices/AMC/documents endpoints
+- payroll seed script
+- WhatsApp dispatch verification script
+- production acceptance workflow script
+- deployment documentation
+
+Apply from chat artifact:
+- /mnt/data/aum_phase4_full_wiring_patch.zip
+- /mnt/data/aum_phase4_full_wiring.patch
